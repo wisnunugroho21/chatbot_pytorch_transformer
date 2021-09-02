@@ -154,21 +154,24 @@ class Transformer(nn.Module):
     
     def decode(self, target_words: Tensor, target_mask: Tensor, src_embeddings: Tensor) -> Tensor:
         tgt_embeddings = self.pos_encoding(self.tgt_tok_emb(target_words))
+
         for layer in self.decoder:
             tgt_embeddings = layer(tgt_embeddings, src_embeddings, target_mask)
-        return tgt_embeddings
+
+        out = self.logit(tgt_embeddings)
+        return out
         
     def forward(self, src_words: Tensor, src_mask: Tensor, target_words: Tensor, target_mask: Tensor) -> Tensor:
         encoded = self.encode(src_words, src_mask)
         decoded = self.decode(target_words, target_mask, encoded)
-        out     = self.logit(decoded)
-        return out
+        return decoded
 
 class ConversationDataset(Dataset):
-    def __init__(self, file_path, max_len = 100) -> None:
+    def __init__(self, file_path, max_len = 100, init_dataset = True) -> None:
         super().__init__()
 
-        self._init_dataset(file_path, max_len)
+        if init_dataset:
+            self._init_dataset(file_path, max_len)
 
     def __len__(self):
         return len(self.src_batch)
@@ -179,7 +182,7 @@ class ConversationDataset(Dataset):
         tgt_input   = tgt[:-1]
         tgt_target  = tgt[1:]
 
-        src_mask, tgt_mask = self.create_mask(src, tgt_input)
+        src_mask, tgt_mask = self.create_src_mask(src), self.create_tgt_mask(tgt_input)
         return src, src_mask, tgt_input, tgt_mask, tgt_target
 
     def _init_dataset(self, file_path, max_len):
@@ -231,20 +234,21 @@ class ConversationDataset(Dataset):
         mask = torch.triu(torch.ones((sz, sz))).transpose(0, 1)
         return mask
 
-    def create_mask(self, src, tgt):
-        src_seq_len = src.shape[-1]
-        tgt_seq_len = tgt.shape[-1]
+    def create_src_mask(self, src):
+        src_seq_len         = src.shape[-1]
+        src_lookahead_mask  = torch.ones((src_seq_len, src_seq_len)).bool().to(device).to(device)
+        src_padding_mask    = (src != PAD_IDX)
+        src_mask            = src_padding_mask.unsqueeze(0) & src_lookahead_mask
 
-        src_lookahead_mask = torch.ones((src_seq_len, src_seq_len)).bool()
-        tgt_lookahead_mask = self.generate_square_subsequent_mask(tgt_seq_len).bool()
+        return src_mask.unsqueeze(0)
 
-        src_padding_mask = (src != PAD_IDX)
-        tgt_padding_mask = (tgt != PAD_IDX)
+    def create_tgt_mask(self, tgt):
+        tgt_seq_len         = tgt.shape[-1]
+        tgt_lookahead_mask  = self.generate_square_subsequent_mask(tgt_seq_len).bool().to(device)
+        tgt_padding_mask    = (tgt != PAD_IDX)
+        tgt_mask            = tgt_padding_mask.unsqueeze(0) & tgt_lookahead_mask
 
-        src_mask = src_padding_mask.unsqueeze(0) & src_lookahead_mask
-        tgt_mask = tgt_padding_mask.unsqueeze(0) & tgt_lookahead_mask
-
-        return src_mask.unsqueeze(0), tgt_mask.unsqueeze(0)
+        return tgt_mask.unsqueeze(0)
 
 d_model = 512
 heads = 8
@@ -254,12 +258,13 @@ batch_size = 100
 max_len = 30
 train_len = 140000
 file_path = './data_conversation.csv'
+train = False
 
-dataset     = ConversationDataset(file_path, max_len = max_len)
-transformer = Transformer(d_model, heads, num_layers, len(dataset.vocab_transform)).to(device)
+dataset         = ConversationDataset(file_path, max_len = max_len)
+transformer     = Transformer(d_model, heads, num_layers, len(dataset.vocab_transform)).to(device)
 
-loss_fn     = torch.nn.CrossEntropyLoss(ignore_index = PAD_IDX)
-optimizer   = torch.optim.AdamW(transformer.parameters(), lr = 0.0001, betas = (0.9, 0.98), eps = 1e-9)
+loss_fn         = torch.nn.CrossEntropyLoss(ignore_index = PAD_IDX)
+optimizer       = torch.optim.AdamW(transformer.parameters(), lr = 0.0001, betas = (0.9, 0.98), eps = 1e-9)
 
 train_indices   = torch.randperm(len(dataset))[:train_len]
 eval_indices    = torch.randperm(len(dataset))[train_len:]
@@ -288,9 +293,11 @@ def train_epoch():
 
 def evaluate():
     losses          = 0
-    eval_dataloader = DataLoader(dataset, batch_size = batch_size, sampler = SubsetRandomSampler(train_indices))
+    accuracy        = 0
+    total           = 0
+    eval_dataloader = DataLoader(dataset, batch_size = batch_size, sampler = SubsetRandomSampler(eval_indices))
 
-    transformer.train()
+    transformer.eval()
     for src, src_mask, tgt_input, tgt_mask, tgt_target in eval_dataloader:
         src, src_mask, tgt_input, tgt_mask, tgt_target = src.to(device), src_mask.to(device), tgt_input.to(device), tgt_mask.to(device), tgt_target.to(device)
 
@@ -299,81 +306,56 @@ def evaluate():
         tgt_target  = tgt_target.flatten()
 
         loss        = loss_fn(pred, tgt_target)
-        losses      += loss.item()
+        losses      += loss.item()        
 
-        accuracy    = (pred.argmax(-1) == tgt_target).sum()
+        accuracy    += (pred.argmax(-1) == tgt_target).sum().item()
+        total       += tgt_target.size(0)
 
-    return losses / len(eval_dataloader), accuracy / len(eval_dataloader)
+    return losses / len(eval_dataloader), accuracy / total
 
-for epoch in range(1, epochs + 1):
-    print(f"Start epoch: {epoch}")
+if train:
+    for epoch in range(1, epochs + 1):
+        print(f"Start epoch: {epoch}")
 
-    start_time  = timer()
-    train_loss  = train_epoch()
-    end_time    = timer()
+        start_time  = timer()
+        train_loss  = train_epoch()
+        end_time    = timer()
 
-    val_loss, val_acc = evaluate()
+        val_loss, val_acc = evaluate()
 
-    print((f"Epoch: {epoch}, Train loss: {train_loss:.3f}, Val loss: {val_loss:.3f}, Val acc: {val_acc:.3f}, "f"Epoch time = {(end_time - start_time):.3f}s"))
+        print((f"Epoch: {epoch}, Train loss: {train_loss:.3f}, Val loss: {val_loss:.3f}, Val acc: {val_acc:.3f}, "f"Epoch time = {(end_time - start_time):.3f}s"))
 
-state = { 'epoch': epoch, 'transformer': transformer, 'transformer_optimizer': optimizer }
-torch.save(state, 'checkpoint.pth.tar')
+    state = { 'model_state_dict': transformer.state_dict(), 'optimizer_state_dict': optimizer.state_dict() }
+    torch.save(state, 'transformer.tar')
 
-checkpoint = torch.load('checkpoint.pth.tar')
-transformer = checkpoint['transformer']
+checkpoint  = torch.load('transformer.tar', map_location = device)
+transformer.load_state_dict(checkpoint['model_state_dict'])
 
+def predict_answer(src):
+    src         = dataset.text_transform(question).unsqueeze(0).to(device)
+    src_mask    = dataset.create_src_mask(src).to(device)
 
-#
-#
-# The area below is still unfinished
-#
-#
+    encoded = transformer.encode(src, src_mask)
+    ys      = torch.full((1, 1), BOS_IDX).type_as(src).to(device)
 
+    for i in range(max_len - 1):
+        tgt_mask        = dataset.create_tgt_mask(ys)
+        logit           = transformer.decode(ys, tgt_mask, encoded)
+        next_word       = logit[:, -1].argmax(-1).item()
 
-# function to generate output sequence using greedy algorithm
-# def greedy_decode(model, src, src_mask, max_len, start_symbol):
-#     src = src.to(DEVICE)
-#     src_mask = src_mask.to(DEVICE)
+        ys = torch.cat([ys, torch.full((1, 1), next_word).type_as(src).to(device)], dim = 1)
+        if next_word == EOS_IDX:
+            break
+           
+    ys = ys.flatten().cpu().tolist()
+    ys = " ".join(dataset.vocab_transform.lookup_tokens(ys)).replace("<bos>", "").replace("<eos>", "")
+    return ys
 
-#     memory = model.encode(src, src_mask)
-#     ys = torch.ones(1, 1).fill_(start_symbol).type(torch.long).to(DEVICE)
-#     for i in range(max_len-1):
-#         memory = memory.to(DEVICE)
-#         tgt_mask = (generate_square_subsequent_mask(ys.size(0))
-#                     .type(torch.bool)).to(DEVICE)
-#         out = model.decode(ys, memory, tgt_mask)
-#         out = out.transpose(0, 1)
-#         prob = model.generator(out[:, -1])
-#         _, next_word = torch.max(prob, dim=1)
-#         next_word = next_word.item()
-
-#         ys = torch.cat([ys,
-#                         torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=0)
-#         if next_word == EOS_IDX:
-#             break
-#     return ys
-
-
-# # actual function to translate input sentence into target language
-# def translate(model: torch.nn.Module, src_sentence: str):
-#     model.eval()
-#     src = text_transform[SRC_LANGUAGE](src_sentence).view(-1, 1)
-#     num_tokens = src.shape[0]
-#     src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool)
-#     tgt_tokens = greedy_decode(
-#         model,  src, src_mask, max_len=num_tokens + 5, start_symbol=BOS_IDX).flatten()
-#     return " ".join(vocab_transform[TGT_LANGUAGE].lookup_tokens(list(tgt_tokens.cpu().numpy()))).replace("<bos>", "").replace("<eos>", "")
-
-# print(translate(transformer, "Eine Gruppe von Menschen steht vor einem Iglu ."))
-
-# while(1):
-#     question = input("Question: ") 
-#     if question == 'quit':
-#         break
-#     max_len = input("Maximum Reply Length: ")
-#     enc_qus = [word_map.get(word, word_map['<unk>']) for word in question.split()]
-#     question = torch.LongTensor(enc_qus).to(device).unsqueeze(0)
-#     question_mask = (question!=0).to(device).unsqueeze(1).unsqueeze(1)  
-#     sentence = evaluate(transformer, question, question_mask, int(max_len), word_map)
-#     print(sentence)
-
+while(1):
+    print('----------')
+    question = input("Question: ")
+    if question == 'quit':
+        break
+        
+    sentence = predict_answer(question)
+    print("Answer: " + sentence)   
