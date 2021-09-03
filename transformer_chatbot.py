@@ -182,7 +182,9 @@ class ConversationDataset(Dataset):
         tgt_input   = tgt[:-1]
         tgt_target  = tgt[1:]
 
-        src_mask, tgt_mask = self.create_src_mask(src), self.create_tgt_mask(tgt_input)
+        src, tgt_input, tgt_target  = src.to(device), tgt_input.to(device), tgt_target.to(device)
+        src_mask, tgt_mask          = self.create_src_mask(src), self.create_tgt_mask(tgt_input)
+
         return src, src_mask, tgt_input, tgt_mask, tgt_target
 
     def _init_dataset(self, file_path, max_len):
@@ -200,6 +202,9 @@ class ConversationDataset(Dataset):
         self.vocab_transform    = build_vocab_from_iterator(self.yield_tokens(words), min_freq = 1, specials = special_symbols, special_first = True)
         self.text_transform     = self.sequential_transforms(self.token_transform, self.vocab_transform, self.tensor_transform)
 
+        print('set default index')
+        self.vocab_transform.set_default_index(UNK_IDX)
+
         print('transform batch')
         src_batch, tgt_batch = [], []
         for src_sample, tgt_sample in zip(question, answer):
@@ -215,6 +220,7 @@ class ConversationDataset(Dataset):
         self.tgt_batch  = tgt_batch[:, :max_len]
 
         print('finish init dataset')
+        print('----')
 
     def yield_tokens(self, data_iter):
         for data_sample in data_iter:
@@ -236,7 +242,7 @@ class ConversationDataset(Dataset):
 
     def create_src_mask(self, src):
         src_seq_len         = src.shape[-1]
-        src_lookahead_mask  = torch.ones((src_seq_len, src_seq_len)).bool().to(device).to(device)
+        src_lookahead_mask  = torch.ones((src_seq_len, src_seq_len)).bool().to(device)
         src_padding_mask    = (src != PAD_IDX)
         src_mask            = src_padding_mask.unsqueeze(0) & src_lookahead_mask
 
@@ -253,12 +259,12 @@ class ConversationDataset(Dataset):
 d_model = 512
 heads = 8
 num_layers = 6
-epochs = 10
+epochs = 4
 batch_size = 100
 max_len = 30
 train_len = 140000
 file_path = './data_conversation.csv'
-train = False
+train = True
 
 dataset         = ConversationDataset(file_path, max_len = max_len)
 transformer     = Transformer(d_model, heads, num_layers, len(dataset.vocab_transform)).to(device)
@@ -326,9 +332,11 @@ if train:
         print((f"Epoch: {epoch}, Train loss: {train_loss:.3f}, Val loss: {val_loss:.3f}, Val acc: {val_acc:.3f}, "f"Epoch time = {(end_time - start_time):.3f}s"))
 
     state = { 'model_state_dict': transformer.state_dict(), 'optimizer_state_dict': optimizer.state_dict() }
-    torch.save(state, 'transformer.tar')
+    torch.save(state, 'transformer1.tar')
 
-checkpoint  = torch.load('transformer.tar', map_location = device)
+    print('finish training')
+
+checkpoint  = torch.load('transformer1.tar', map_location = device)
 transformer.load_state_dict(checkpoint['model_state_dict'])
 
 def predict_answer(src):
