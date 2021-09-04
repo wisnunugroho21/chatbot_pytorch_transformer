@@ -220,7 +220,6 @@ class ConversationDataset(Dataset):
         self.tgt_batch  = tgt_batch[:, :max_len]
 
         print('finish init dataset')
-        print('----')
 
     def yield_tokens(self, data_iter):
         for data_sample in data_iter:
@@ -270,7 +269,7 @@ dataset         = ConversationDataset(file_path, max_len = max_len)
 transformer     = Transformer(d_model, heads, num_layers, len(dataset.vocab_transform)).to(device)
 
 loss_fn         = torch.nn.CrossEntropyLoss(ignore_index = PAD_IDX)
-optimizer       = torch.optim.AdamW(transformer.parameters(), lr = 0.0001, betas = (0.9, 0.98), eps = 1e-9)
+optimizer       = torch.optim.AdamW(transformer.parameters(), lr = 0.001, betas = (0.9, 0.98), eps = 1e-9)
 
 train_indices   = torch.randperm(len(dataset))[:train_len]
 eval_indices    = torch.randperm(len(dataset))[train_len:]
@@ -320,6 +319,8 @@ def evaluate():
     return losses / len(eval_dataloader), accuracy / total
 
 if train:
+    print('----------')
+
     for epoch in range(1, epochs + 1):
         print(f"Start epoch: {epoch}")
 
@@ -332,11 +333,11 @@ if train:
         print((f"Epoch: {epoch}, Train loss: {train_loss:.3f}, Val loss: {val_loss:.3f}, Val acc: {val_acc:.3f}, "f"Epoch time = {(end_time - start_time):.3f}s"))
 
     state = { 'model_state_dict': transformer.state_dict(), 'optimizer_state_dict': optimizer.state_dict() }
-    torch.save(state, 'transformer1.tar')
+    torch.save(state, 'transformer.tar')
 
     print('finish training')
 
-checkpoint  = torch.load('transformer1.tar', map_location = device)
+checkpoint  = torch.load('transformer.tar', map_location = device)
 transformer.load_state_dict(checkpoint['model_state_dict'])
 
 def predict_answer(src):
@@ -344,17 +345,18 @@ def predict_answer(src):
     src_mask    = dataset.create_src_mask(src).to(device)
 
     encoded = transformer.encode(src, src_mask)
-    ys      = torch.full((1, 1), BOS_IDX).type_as(src).to(device)
+    start_y = torch.tensor( [[BOS_IDX]] ).type_as(src).to(device)
+    ys      = start_y
 
     for i in range(max_len - 1):
         tgt_mask        = dataset.create_tgt_mask(ys)
         logit           = transformer.decode(ys, tgt_mask, encoded)
-        next_word       = logit[:, -1].argmax(-1).item()
+        next_word       = logit.argmax(-1)
 
-        ys = torch.cat([ys, torch.full((1, 1), next_word).type_as(src).to(device)], dim = 1)
-        if next_word == EOS_IDX:
+        ys = torch.cat([start_y, next_word], dim = 1)
+        if next_word[0, -1].item() == EOS_IDX:
             break
-           
+
     ys = ys.flatten().cpu().tolist()
     ys = " ".join(dataset.vocab_transform.lookup_tokens(ys)).replace("<bos>", "").replace("<eos>", "")
     return ys
