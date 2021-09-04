@@ -10,6 +10,7 @@ from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader, SubsetRandomSampler
+from torch.cuda.amp import GradScaler
 
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
@@ -73,7 +74,8 @@ class MultiHeadAttention(nn.Module):
         scores      = scores / math.sqrt(query.size(-1))
         
         if mask is not None:
-            scores  = scores.masked_fill(mask == 0, -1e9)
+            min_type_value  = torch.finfo(scores.dtype).min
+            scores  = scores.masked_fill(mask == 0, min_type_value)
              
         weights     = F.softmax(scores, dim = -1)
         weights     = self.dropout(weights)
@@ -182,9 +184,7 @@ class ConversationDataset(Dataset):
         tgt_input   = tgt[:-1]
         tgt_target  = tgt[1:]
 
-        src, tgt_input, tgt_target  = src.to(device), tgt_input.to(device), tgt_target.to(device)
         src_mask, tgt_mask          = self.create_src_mask(src), self.create_tgt_mask(tgt_input)
-
         return src, src_mask, tgt_input, tgt_mask, tgt_target
 
     def _init_dataset(self, file_path, max_len):
@@ -241,7 +241,7 @@ class ConversationDataset(Dataset):
 
     def create_src_mask(self, src):
         src_seq_len         = src.shape[-1]
-        src_lookahead_mask  = torch.ones((src_seq_len, src_seq_len)).bool().to(device)
+        src_lookahead_mask  = torch.ones((src_seq_len, src_seq_len)).bool()
         src_padding_mask    = (src != PAD_IDX)
         src_mask            = src_padding_mask.unsqueeze(0) & src_lookahead_mask
 
@@ -249,7 +249,7 @@ class ConversationDataset(Dataset):
 
     def create_tgt_mask(self, tgt):
         tgt_seq_len         = tgt.shape[-1]
-        tgt_lookahead_mask  = self.generate_square_subsequent_mask(tgt_seq_len).bool().to(device)
+        tgt_lookahead_mask  = self.generate_square_subsequent_mask(tgt_seq_len).bool()
         tgt_padding_mask    = (tgt != PAD_IDX)
         tgt_mask            = tgt_padding_mask.unsqueeze(0) & tgt_lookahead_mask
 
@@ -259,39 +259,45 @@ d_model = 512
 heads = 8
 num_layers = 6
 epochs = 4
-batch_size = 100
+batch_size = 80
 max_len = 30
 train_len = 140000
 file_path = './data_conversation.csv'
 train = True
 
 dataset         = ConversationDataset(file_path, max_len = max_len)
-transformer     = Transformer(d_model, heads, num_layers, len(dataset.vocab_transform)).to(device)
+transformer     = Transformer(d_model, heads, num_layers, len(dataset.vocab_transform))
 
 loss_fn         = torch.nn.CrossEntropyLoss(ignore_index = PAD_IDX)
 optimizer       = torch.optim.AdamW(transformer.parameters(), lr = 0.001, betas = (0.9, 0.98), eps = 1e-9)
+scaler          = GradScaler()
 
 train_indices   = torch.randperm(len(dataset))[:train_len]
 eval_indices    = torch.randperm(len(dataset))[train_len:]
 
+checkpoint  = torch.load('transformer.tar', map_location = device)
+transformer.load_state_dict(checkpoint['model_state_dict'])
+
 def train_epoch():    
     losses              = 0
-    train_dataloader    = DataLoader(dataset, batch_size = batch_size, sampler = SubsetRandomSampler(train_indices))
+    train_dataloader    = DataLoader(dataset, batch_size = batch_size, sampler = SubsetRandomSampler(train_indices), num_workers = 4, pin_memory = True)
 
     transformer.train()
     for src, src_mask, tgt_input, tgt_mask, tgt_target in train_dataloader:
         src, src_mask, tgt_input, tgt_mask, tgt_target = src.to(device), src_mask.to(device), tgt_input.to(device), tgt_mask.to(device), tgt_target.to(device)
 
-        pred        = transformer(src, src_mask, tgt_input, tgt_mask)
-        pred        = pred.flatten(0, 1)
-        tgt_target  = tgt_target.flatten()
-
         optimizer.zero_grad()
+        with torch.cuda.amp.autocast():
+            pred        = transformer(src, src_mask, tgt_input, tgt_mask)
+            pred        = pred.flatten(0, 1)
+            tgt_target  = tgt_target.flatten()        
 
-        loss = loss_fn(pred, tgt_target)
-        loss.backward()
+            loss = loss_fn(pred, tgt_target)
 
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
         losses += loss.item()
 
     return losses / len(train_dataloader)
@@ -304,22 +310,24 @@ def evaluate():
 
     transformer.eval()
     for src, src_mask, tgt_input, tgt_mask, tgt_target in eval_dataloader:
-        src, src_mask, tgt_input, tgt_mask, tgt_target = src.to(device), src_mask.to(device), tgt_input.to(device), tgt_mask.to(device), tgt_target.to(device)
+        src, src_mask, tgt_input, tgt_mask, tgt_target = src.to(device), src_mask.to(device), tgt_input.to(device), tgt_mask.to(device), tgt_target.to(device)        
 
-        pred        = transformer(src, src_mask, tgt_input, tgt_mask)
-        pred        = pred.flatten(0, 1)
-        tgt_target  = tgt_target.flatten()
+        with torch.no_grad():
+            pred        = transformer(src, src_mask, tgt_input, tgt_mask)
+            pred        = pred.flatten(0, 1)
+            tgt_target  = tgt_target.flatten()
 
-        loss        = loss_fn(pred, tgt_target)
-        losses      += loss.item()        
+            loss        = loss_fn(pred, tgt_target)
+            losses      += loss.item()        
 
-        accuracy    += (pred.argmax(-1) == tgt_target).sum().item()
-        total       += tgt_target.size(0)
+            accuracy    += (pred.argmax(-1) == tgt_target).sum().item()
+            total       += tgt_target.size(0)
 
     return losses / len(eval_dataloader), accuracy / total
 
 if train:
     print('----------')
+    transformer = transformer.to(device)
 
     for epoch in range(1, epochs + 1):
         print(f"Start epoch: {epoch}")
@@ -332,20 +340,21 @@ if train:
 
         print((f"Epoch: {epoch}, Train loss: {train_loss:.3f}, Val loss: {val_loss:.3f}, Val acc: {val_acc:.3f}, "f"Epoch time = {(end_time - start_time):.3f}s"))
 
-    state = { 'model_state_dict': transformer.state_dict(), 'optimizer_state_dict': optimizer.state_dict() }
-    torch.save(state, 'transformer.tar')
+        state = { 'model_state_dict': transformer.state_dict(), 'optimizer_state_dict': optimizer.state_dict() }
+        torch.save(state, 'transformer.tar')
 
     print('finish training')
 
-checkpoint  = torch.load('transformer.tar', map_location = device)
+checkpoint  = torch.load('transformer.tar')
 transformer.load_state_dict(checkpoint['model_state_dict'])
 
 def predict_answer(src):
-    src         = dataset.text_transform(question).unsqueeze(0).to(device)
-    src_mask    = dataset.create_src_mask(src).to(device)
+    src         = dataset.text_transform(question).unsqueeze(0)
+    src_mask    = dataset.create_src_mask(src)
+    src         = src
 
     encoded = transformer.encode(src, src_mask)
-    start_y = torch.tensor( [[BOS_IDX]] ).type_as(src).to(device)
+    start_y = torch.tensor( [[BOS_IDX]] ).type_as(src)
     ys      = start_y
 
     for i in range(max_len - 1):
