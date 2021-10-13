@@ -62,7 +62,7 @@ class MultiHeadAttention(nn.Module):
         self.out        = nn.Linear(d_model, d_model)
         
     def forward(self, query: Tensor, key: Tensor, value: Tensor, mask: Tensor = None) -> Tensor:
-        d_sqrt  = math.sqrt(query.size(-1))        
+        d_sqrt  = math.sqrt(query.size(-1))    
 
         trans_query = query.view(query.shape[0], self.heads, -1, self.d_k)
         trans_key   = key.view(key.shape[0], self.heads, -1, self.d_k)
@@ -84,7 +84,7 @@ class MultiHeadAttention(nn.Module):
             min_type_value  = torch.finfo(beta.dtype).min
             beta            = beta.masked_fill(mask == 0, min_type_value)
 
-        beta            = F.softmax(beta, dim = 1)
+        beta            = F.softmax(beta, dim = 2)
         global_key      = (beta * phi).sum(dim = 2, keepdim = True)
 
         uhi             = (global_key * trans_value).transpose(1, 2).flatten(2)
